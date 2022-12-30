@@ -1,2 +1,6 @@
-# WebGPU-3D-Boids
-3D boids using WebGPU
+# WebGPU-Cascaded-Shadow-Mapping
+
+Cascaded Shadow Mapping implemented with WebGPU.
+
+This is just an experiment showing a possible CSM implementation in WebGPU.
+It is also possible to switch between simple shadow mapping and CSM for comparison.
