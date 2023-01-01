@@ -3,13 +3,19 @@ import { Camera } from "./camera";
 import { IDirectionalLight, Renderable, Renderer } from "./renderer";
 import shader from "./csmShadow.wgsl";
 import { preprocess } from "../preprocessor/preprocessor";
-import { GUI } from "dat.gui";
+import {
+    IShadowRendererResolutionChangeListener,
+    IShadowSettingsProvider,
+} from "./simpleShadowRenderer";
 
-export interface SimpleShadowRendererResolutionChangeListener {
-    onResolutionChanged(newResolution: number): unknown;
+interface IStoredSettings {
+    minBias: number;
+    maxBias: number;
+    zMult: number;
+    assignmentExponent: number;
 }
 
-export class CMSShadowRenderer {
+export class CSMShadowRenderer implements IShadowSettingsProvider {
     private device: GPUDevice;
     private mainRenderer: Renderer;
 
@@ -28,26 +34,45 @@ export class CMSShadowRenderer {
     private camera?: Camera;
     private directionalLightData?: IDirectionalLight;
 
+    private minBias = 0.0005;
+    private maxBias = 0.001;
     private shadowMapResolution = 2048;
     private followCameraFrustum = true;
     private lastViewProjections?: mat4[];
     private numOfCascades = 4;
-    private zMult = 2.5;
+    private zMult = 10;
+    private shadowDepthPercentage = 1.0;
+    private assignmentExponent = 2.5;
+    private backfaceCulling = true;
+
+    private static storedSettings?: IStoredSettings;
 
     private guiFolder?: dat.GUI;
 
-    public resolutionChangeListener: SimpleShadowRendererResolutionChangeListener[] =
+    public resolutionChangeListener: IShadowRendererResolutionChangeListener[] =
         [];
-
-    private backfaceCulling = true;
 
     constructor(
         mainRenderer: Renderer,
         device: GPUDevice,
-        perRenderableBindGroupLayout: GPUBindGroupLayout
+        perRenderableBindGroupLayout: GPUBindGroupLayout,
+        settings?: IShadowSettingsProvider
     ) {
         this.device = device;
         this.mainRenderer = mainRenderer;
+        if (settings != null) {
+            this.backfaceCulling = settings.isCullingBackfaces();
+            this.shadowMapResolution = settings.getResolution();
+            this.followCameraFrustum = settings.isFollowingCamera();
+            this.shadowDepthPercentage = settings.getShadowDepthPercentage();
+        }
+        if (CSMShadowRenderer.storedSettings != null) {
+            this.minBias = CSMShadowRenderer.storedSettings.minBias;
+            this.maxBias = CSMShadowRenderer.storedSettings.maxBias;
+            this.zMult = CSMShadowRenderer.storedSettings.zMult;
+            this.assignmentExponent =
+                CSMShadowRenderer.storedSettings.assignmentExponent;
+        }
 
         this.registerControllers(mainRenderer.getControllerGUI());
 
@@ -69,12 +94,39 @@ export class CMSShadowRenderer {
 
         this.shadowRendererPipeline = this.createShadowRendererPipeline(
             [this.perFrameBindGroupLayout, perRenderableBindGroupLayout],
-            "back"
+            this.backfaceCulling ? "back" : "front"
         );
+    }
+
+    isCullingBackfaces(): boolean {
+        return this.backfaceCulling;
+    }
+
+    getResolution(): number {
+        return this.shadowMapResolution;
+    }
+
+    isFollowingCamera(): boolean {
+        return this.followCameraFrustum;
+    }
+
+    getShadowDepthPercentage(): number {
+        return this.shadowDepthPercentage;
+    }
+
+    getMinBias() {
+        return this.minBias;
+    }
+
+    getMaxBias() {
+        return this.maxBias;
     }
 
     registerControllers(gui: dat.GUI) {
         const folder = gui.addFolder("csm shadow renderer");
+        folder.add(this, "minBias", 0, 0.01, 0.0005);
+        folder.add(this, "maxBias", 0, 0.01, 0.0005);
+        folder.add(this, "shadowDepthPercentage", 0, 1);
         folder
             .add(
                 this,
@@ -82,11 +134,12 @@ export class CMSShadowRenderer {
                 [256, 512, 1024, 2048, 4096, 8192]
             )
             .onChange((val) => this.setShadowMapResolution(val));
-        folder.add(this, "followCameraFrustum", true);
+        folder.add(this, "followCameraFrustum", this.followCameraFrustum);
         folder
-            .add(this, "backfaceCulling", true)
+            .add(this, "backfaceCulling", this.backfaceCulling)
             .onChange(() => this.onFaceCullingChanged());
-        folder.add(this, "zMult", 0, 50, 0.5);
+        folder.add(this, "assignmentExponent", 1, 4, 0.5);
+        folder.add(this, "zMult", 0, 15, 0.5);
         folder.close();
 
         this.guiFolder = folder;
@@ -251,18 +304,18 @@ export class CMSShadowRenderer {
     }
 
     getLightViewProjections() {
-        const cascadePercentage = 1.0 / this.numOfCascades;
         if (this.camera == null || this.directionalLightData == null) {
             return [mat4.create()];
         }
 
-        console.log("view");
         const cascadesViewProjections = [];
 
         for (let i = 0; i < this.numOfCascades; ++i) {
+            let f = (x: number) => Math.pow(x, this.assignmentExponent);
             let corners = this.camera.getWorldSpaceCorners(
-                cascadePercentage * i,
-                cascadePercentage * (i + 1)
+                this.shadowDepthPercentage * f(i / (this.numOfCascades - 1)),
+                this.shadowDepthPercentage *
+                    f((i + 1) / (this.numOfCascades - 1))
             );
             const center = vec3.clone(corners[0]);
             for (let i = 1; i < 8; ++i) {
@@ -394,6 +447,12 @@ export class CMSShadowRenderer {
         if (this.guiFolder != null) {
             this.mainRenderer.getControllerGUI().removeFolder(this.guiFolder);
         }
+        CSMShadowRenderer.storedSettings = {
+            minBias: this.minBias,
+            maxBias: this.maxBias,
+            zMult: this.zMult,
+            assignmentExponent: this.assignmentExponent,
+        };
         this.mainRenderer.getTextureDebugRenderer()?.setTexture(null);
     }
 }

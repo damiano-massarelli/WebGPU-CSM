@@ -4,11 +4,24 @@ import { Camera } from "./camera";
 import { IDirectionalLight, Renderable, Renderer } from "./renderer";
 import shader from "./simpleShadow.wgsl";
 
-export interface SimpleShadowRendererResolutionChangeListener {
+export interface IShadowRendererResolutionChangeListener {
     onResolutionChanged(newResolution: number): unknown;
 }
 
-export class SimpleShadowRenderer {
+export interface IShadowSettingsProvider {
+    isCullingBackfaces(): boolean;
+    getResolution(): number;
+    isFollowingCamera(): boolean;
+    getShadowDepthPercentage(): number;
+}
+
+interface IStoredSettings {
+    minBias: number;
+    maxBias: number;
+    zMult: number;
+}
+
+export class SimpleShadowRenderer implements IShadowSettingsProvider {
     private device: GPUDevice;
 
     private shadowMapTexture: GPUTexture;
@@ -31,21 +44,38 @@ export class SimpleShadowRenderer {
     private followCameraFrustum = true;
     private lastCameraFrustumCorners?: vec3[];
 
-    public resolutionChangeListener: SimpleShadowRendererResolutionChangeListener[] =
+    public resolutionChangeListener: IShadowRendererResolutionChangeListener[] =
         [];
 
+    private minBias = 0.0005;
+    private maxBias = 0.001;
     private backfaceCulling = true;
+    private zMult = 3.5;
 
     private mainRenderer: Renderer;
     private guiFolder?: dat.GUI;
 
+    private static storedSettings?: IStoredSettings;
+
     constructor(
         mainRenderer: Renderer,
         device: GPUDevice,
-        perRenderableBindGroupLayout: GPUBindGroupLayout
+        perRenderableBindGroupLayout: GPUBindGroupLayout,
+        settings?: IShadowSettingsProvider
     ) {
         this.device = device;
         this.mainRenderer = mainRenderer;
+        if (settings != null) {
+            this.backfaceCulling = settings.isCullingBackfaces();
+            this.shadowMapResolution = settings.getResolution();
+            this.followCameraFrustum = settings.isFollowingCamera();
+            this.shadowDepthPercentage = settings.getShadowDepthPercentage();
+        }
+        if (SimpleShadowRenderer.storedSettings != null) {
+            this.minBias = SimpleShadowRenderer.storedSettings.minBias;
+            this.maxBias = SimpleShadowRenderer.storedSettings.maxBias;
+            this.zMult = SimpleShadowRenderer.storedSettings.zMult;
+        }
 
         this.registerControllers(mainRenderer.getControllerGUI());
 
@@ -67,12 +97,38 @@ export class SimpleShadowRenderer {
 
         this.shadowRendererPipeline = this.createShadowRendererPipeline(
             [this.perFrameBindGroupLayout, perRenderableBindGroupLayout],
-            "back"
+            this.backfaceCulling ? "back" : "front"
         );
+    }
+
+    isCullingBackfaces(): boolean {
+        return this.backfaceCulling;
+    }
+
+    getResolution(): number {
+        return this.shadowMapResolution;
+    }
+
+    isFollowingCamera(): boolean {
+        return this.followCameraFrustum;
+    }
+
+    getShadowDepthPercentage(): number {
+        return this.shadowDepthPercentage;
+    }
+
+    getMinBias() {
+        return this.minBias;
+    }
+
+    getMaxBias() {
+        return this.maxBias;
     }
 
     registerControllers(gui: dat.GUI) {
         const folder = gui.addFolder("simple shadow renderer");
+        folder.add(this, "minBias", 0, 0.01, 0.0005);
+        folder.add(this, "maxBias", 0, 0.01, 0.0005);
         folder.add(this, "shadowDepthPercentage", 0, 1);
         folder
             .add(
@@ -81,15 +137,12 @@ export class SimpleShadowRenderer {
                 [256, 512, 1024, 2048, 4096, 8192]
             )
             .onChange((val) => this.setShadowMapResolution(val));
-        folder.add(this, "followCameraFrustum", true).onChange(() => {
-            this.lastCameraFrustumCorners = this.camera?.getWorldSpaceCorners(
-                0,
-                this.shadowDepthPercentage
-            );
-        });
+        folder.add(this, "followCameraFrustum", this.followCameraFrustum);
+
         folder
-            .add(this, "backfaceCulling", true)
+            .add(this, "backfaceCulling", this.backfaceCulling)
             .onChange(() => this.onFaceCullingChanged());
+        folder.add(this, "zMult", 0, 15, 0.5);
         folder.close();
 
         this.guiFolder = folder;
@@ -269,6 +322,8 @@ export class SimpleShadowRenderer {
             corners = this.lastCameraFrustumCorners;
         }
 
+        this.lastCameraFrustumCorners = corners;
+
         const center = vec3.clone(corners[0]);
         for (let i = 1; i < 8; ++i) {
             vec3.add(center, center, corners[i]);
@@ -298,6 +353,18 @@ export class SimpleShadowRenderer {
             maxX = Math.max(viewSpaceCorner[0], maxX);
             maxY = Math.max(viewSpaceCorner[1], maxY);
             maxZ = Math.max(viewSpaceCorner[2], maxZ);
+        }
+
+        if (minZ < 0) {
+            minZ *= this.zMult; // become even more negative :)
+        } else {
+            minZ /= this.zMult; // reduce value
+        }
+
+        if (maxZ < 0) {
+            maxZ /= this.zMult; // become less negative :)
+        } else {
+            maxZ *= this.zMult; // increase value
         }
 
         const projMatrix = mat4.create();

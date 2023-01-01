@@ -24,9 +24,14 @@ fn getVisibility(shadowMapCoords: vec3<f32>, lightDirection: vec3<f32>, surfaceN
     return clamp(visibility, 0.0, 1.0);
 }
 
-fn getVisibilityCSM(cascade: i32, shadowMapCoords: vec3<f32>, lightDirection: vec3<f32>, surfaceNormal: vec3<f32>) -> f32 {
-    let pcfResolution = 0;
+fn getVisibilityCSM(cascade: i32, shadowMapCoords: vec3<f32>, lightDirection: vec3<f32>, surfaceNormal: vec3<f32>, hasNextCascade: bool) -> f32 {
+    let pcfResolution = i32(shadowMappingParams.pcfResolution);
     let bias = max(shadowMappingParams.minBias, shadowMappingParams.maxBias * (1.0 - dot(lightDirection, surfaceNormal)));
+    
+    let threshold = vec3<f32>(0.2);
+    var edgeAdditionalVisibility = clamp((shadowMapCoords.xyz - (1.0 - threshold)) / threshold, vec3<f32>(0.0), vec3<f32>(1.0));
+    edgeAdditionalVisibility = max(edgeAdditionalVisibility, 1.0 - clamp(shadowMapCoords.xyz / threshold, vec3<f32>(0.0), vec3<f32>(1.0)));
+    
     var cascadeShadowMapCoords = shadowMapCoords;
 
     if (cascade >= 2) {
@@ -51,7 +56,10 @@ fn getVisibilityCSM(cascade: i32, shadowMapCoords: vec3<f32>, lightDirection: ve
         }
     }
 
-    return visibility;
+    let fadeOut = select(max(max(edgeAdditionalVisibility.x, edgeAdditionalVisibility.y), edgeAdditionalVisibility.z), 0.0, hasNextCascade);
+    visibility = visibility / f32((pcfResolution + pcfResolution + 1) * (pcfResolution + pcfResolution + 1)) + fadeOut;
+
+    return clamp(visibility, 0.0, 1.0);
 }
 
 fn computeLight(light: LightData, material: Material, cameraPosition: vec3<f32>, position: vec3<f32>, normal: vec3<f32>, visibility: f32, shadowAttenuation: f32) -> vec4<f32> {
@@ -144,7 +152,7 @@ fn vertexShader(@location(0) position : vec3<f32>,
 
 #if useCSM
     // cascade must be selected in the fragment as a triangle can span multiple cascades
-    // (interpolation would not work)
+    // (interpolation would not work). Still, it should be possible to carry out as much work as possible here!
     // -- is there a way to pass array to vertex output / fragment input?
     // for (var i = 0; i < csmCascades; i += 1) {
     //     var shadowProjection = csmLightData.viewProjectionMatrix[i] * positionWS;
@@ -171,18 +179,26 @@ fn fragmentShader(in: VertexOutput) -> @location(0) vec4<f32> {
     var visibility: f32 = 1.0;        
 #if useCSM 
     var selectedCascade = numCascades;
+    var hasNextCascade = false;
     var shadowMapCoords = vec3<f32>(-1.0);
     for (var i = 0; i < numCascades; i += 1) {
         // ideally these operations should be performed in the vs
         var csmShadowMapCoords = csmLightData.viewProjectionMatrix[i] * vec4<f32>(in.positionWS, 1.0);
         csmShadowMapCoords = csmShadowMapCoords / csmShadowMapCoords.w;
         shadowMapCoords = vec3<f32>(csmShadowMapCoords.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5, 0.5), csmShadowMapCoords.z);
-        // --
 
         if (all(shadowMapCoords > vec3<f32>(0.0)) && all(shadowMapCoords < vec3<f32>(1.0))) {
             selectedCascade = i;
+            if (i < numCascades - 1) {
+                var nextShadowCoords = csmLightData.viewProjectionMatrix[i + 1] * vec4<f32>(in.positionWS, 1.0);
+                nextShadowCoords = nextShadowCoords / nextShadowCoords.w;
+                let uvShadowMapCoords = vec3<f32>(csmShadowMapCoords.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5, 0.5), csmShadowMapCoords.z);
+                hasNextCascade = all(uvShadowMapCoords > vec3<f32>(0.0)) && all(uvShadowMapCoords < vec3<f32>(1.0));
+            }
             break;
         }
+        // --
+
     }
 
     let debug_cascadeColors = array<vec4<f32>, 5>(
@@ -197,7 +213,7 @@ fn fragmentShader(in: VertexOutput) -> @location(0) vec4<f32> {
     lightData.ambientIntensity = csmLightData.ambientIntensity;
     lightData.color = csmLightData.color;
     lightData.direction = csmLightData.direction;
-    visibility = getVisibilityCSM(selectedCascade, shadowMapCoords, csmLightData.direction.xyz, in.normalWS);
+    visibility = getVisibilityCSM(selectedCascade, shadowMapCoords, csmLightData.direction.xyz, in.normalWS, hasNextCascade);
     visibility = select(visibility, 1.0, selectedCascade == numCascades); // no cascade found, set visibility to 1
 
     let finalColor = computeLight(lightData, material, cameraData.position.xyz,

@@ -2,7 +2,7 @@ import { Camera, FreeControlledCamera } from "./camera";
 import { IDirectionalLight, Renderable, Renderer } from "./renderer";
 import shader from "./forward.wgsl";
 import { SimpleShadowRenderer } from "./simpleShadowRenderer";
-import { CMSShadowRenderer } from "./csmShadowRenderer";
+import { CSMShadowRenderer } from "./csmShadowRenderer";
 import { preprocess } from "../preprocessor/preprocessor";
 
 export class ForwardRenderer {
@@ -27,7 +27,7 @@ export class ForwardRenderer {
 
     private directionalLightData!: IDirectionalLight;
 
-    private shadowRenderer: SimpleShadowRenderer | CMSShadowRenderer;
+    private shadowRenderer: SimpleShadowRenderer | CSMShadowRenderer;
     private useCSM = false;
     private lightBufferInfo = new Map<string, number>();
     private debug_showCascades = false;
@@ -37,8 +37,8 @@ export class ForwardRenderer {
 
     private shadowMapParametersBuffer: GPUBuffer;
     private shadowMapParameters = {
-        minBias: 0.001,
-        maxBias: 0.005,
+        minBias: -1,
+        maxBias: -1,
         pcfSamples: 9,
     };
 
@@ -122,12 +122,6 @@ export class ForwardRenderer {
     registerControllers(gui: dat.GUI) {
         const folder = gui.addFolder("forward renderer");
         folder
-            .add(this.shadowMapParameters, "minBias", 0, 1, 0.001)
-            .onChange(() => this.updateShadowMappingBuffer());
-        folder
-            .add(this.shadowMapParameters, "maxBias", 0, 1, 0.001)
-            .onChange(() => this.updateShadowMappingBuffer());
-        folder
             .add(this.shadowMapParameters, "pcfSamples", [0, 9, 25, 49, 81])
             .onChange(() => this.updateShadowMappingBuffer());
         folder
@@ -208,18 +202,21 @@ export class ForwardRenderer {
         );
 
         // create appropriate shadow renderer
+        const prevShadowRenderer = this.shadowRenderer;
         this.shadowRenderer.destroy();
         if (this.shadowMode === "CSM") {
-            this.shadowRenderer = new CMSShadowRenderer(
+            this.shadowRenderer = new CSMShadowRenderer(
                 this.mainRenderer,
                 this.device,
-                this.perRenderableBindGroupLayout
+                this.perRenderableBindGroupLayout,
+                prevShadowRenderer
             );
         } else {
             this.shadowRenderer = new SimpleShadowRenderer(
                 this.mainRenderer,
                 this.device,
-                this.perRenderableBindGroupLayout
+                this.perRenderableBindGroupLayout,
+                prevShadowRenderer
             );
         }
         this.shadowRenderer.resolutionChangeListener.push(this);
@@ -625,6 +622,15 @@ export class ForwardRenderer {
             }
         }
 
+        if (
+            this.shadowMapParameters.minBias !=
+                this.shadowRenderer.getMinBias() ||
+            this.shadowMapParameters.maxBias != this.shadowRenderer.getMaxBias()
+        ) {
+            this.shadowMapParameters.minBias = this.shadowRenderer.getMinBias();
+            this.shadowMapParameters.maxBias = this.shadowRenderer.getMaxBias();
+            this.updateShadowMappingBuffer();
+        }
         this.shadowRenderer.render(renderList, commandEncoder);
 
         if (this.viewCamera != null) {
